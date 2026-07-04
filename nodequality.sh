@@ -1,13 +1,108 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+# Host-side dependencies needed before entering BenchOS.
+# On normal Linux distributions the script keeps using the existing PATH.
+# If some commands are missing and Nix is installed, create a tiny PATH shim with
+# the modern `nix shell` CLI so the script also runs on NixOS/minimal systems.
+function setup_host_deps() {
+  [[ "${NODEQUALITY_NIX_DEPS_READY:-}" == "1" ]] && return 0
+
+  # Commands that the original script either needs directly or can use for
+  # fuller host-side detection. Only missing hard-required commands are fatal
+  # when Nix is unavailable; optional ones stay optional to preserve behavior
+  # on ordinary distros.
+  local hard_required_cmds=(
+    awk base64 cat chroot cp curl date df grep gzip mkdir mount ps rm tail tar
+    tee tr umount uname wc
+  )
+  local nix_supplied_cmds=(
+    "${hard_required_cmds[@]}"
+    chmod dd findmnt free ls lsblk lsmod mkswap paste readlink sed sort stat
+    swapoff swapon who
+  )
+  local missing_required_cmds=()
+  local missing_nix_cmds=()
+  local cmd
+
+  for cmd in "${hard_required_cmds[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 || missing_required_cmds+=("$cmd")
+  done
+  for cmd in "${nix_supplied_cmds[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 || missing_nix_cmds+=("$cmd")
+  done
+
+  ((${#missing_nix_cmds[@]} == 0)) && return 0
+
+  if ! command -v nix >/dev/null 2>&1; then
+    if ((${#missing_required_cmds[@]} > 0)); then
+      echo "Error: missing required commands: ${missing_required_cmds[*]}" >&2
+      echo "Install them with your distribution package manager, or install Nix and re-run this script." >&2
+      exit 127
+    fi
+    return 0
+  fi
+
+  local shim_dir="${TMPDIR:-/tmp}/nodequality-nix-path.$$"
+  mkdir -p "$shim_dir" || exit 1
+
+  local nix_installables=(
+    nixpkgs#coreutils-full
+    nixpkgs#curl
+    nixpkgs#gnutar
+    nixpkgs#gzip
+    nixpkgs#util-linux
+    nixpkgs#procps
+    nixpkgs#gawk
+    nixpkgs#gnugrep
+    nixpkgs#gnused
+    nixpkgs#kmod
+  )
+
+  echo "Detected missing host commands: ${missing_nix_cmds[*]}" >&2
+  echo "Entering a Nix-provided dependency environment with: nix shell ${nix_installables[*]}" >&2
+
+  nix --extra-experimental-features "nix-command flakes" shell "${nix_installables[@]}" --command bash -s -- "$shim_dir" "${nix_supplied_cmds[@]}" <<'EOF'
+set -euo pipefail
+shim_dir="$1"
+shift
+for cmd in "$@"; do
+  path="$(command -v "$cmd" 2>/dev/null || true)"
+  if [[ -n "$path" ]]; then
+    ln -sf "$path" "$shim_dir/$cmd"
+  fi
+done
+EOF
+
+  export NODEQUALITY_NIX_DEPS_READY=1
+  export PATH="$shim_dir:$PATH"
+
+  missing_required_cmds=()
+  for cmd in "${hard_required_cmds[@]}"; do
+    command -v "$cmd" >/dev/null 2>&1 || missing_required_cmds+=("$cmd")
+  done
+  if ((${#missing_required_cmds[@]} > 0)); then
+    echo "Error: Nix environment was created, but these required commands are still missing: ${missing_required_cmds[*]}" >&2
+    exit 127
+  fi
+}
+
+setup_host_deps
 
 current_time="$(date +%Y_%m_%d_%H_%M_%S)"
 work_dir=".nodequality$current_time"
 bench_os_url="https://github.com/LloydAsp/NodeQuality/releases/download/v0.0.2/BenchOs.tar.gz"
 raw_file_prefix="https://raw.githubusercontent.com/LloydAsp/NodeQuality/refs/heads/main"
+nexttrace_filename="nexttrace_linux_amd64"
 
-if uname -m | grep -Eq 'arm|aarch64'; then
-  bench_os_url="https://github.com/LloydAsp/NodeQuality/releases/download/v0.0.2/BenchOs-arm.tar.gz"
-fi
+case "$(uname -m)" in
+  aarch64 | arm64)
+    bench_os_url="https://github.com/LloydAsp/NodeQuality/releases/download/v0.0.2/BenchOs-arm.tar.gz"
+    nexttrace_filename="nexttrace_linux_arm64"
+    ;;
+  arm* )
+    bench_os_url="https://github.com/LloydAsp/NodeQuality/releases/download/v0.0.2/BenchOs-arm.tar.gz"
+    ;;
+esac
 
 header_info_filename=header_info.log
 ip_quality_filename=ip_quality.log
@@ -177,7 +272,7 @@ function get_opts() {
 
 function pre_init() {
   mkdir -p "$work_dir"
-  cd $work_dir
+  cd "$work_dir"
   work_dir="$(pwd)"
 }
 
@@ -193,20 +288,20 @@ function pre_cleanup() {
 }
 
 function clear_mount() {
-  swapoff $work_dir/swap 2>/dev/null
+  swapoff "$work_dir/swap" 2>/dev/null
 
-  umount $work_dir/BenchOs/proc/ 2>/dev/null
-  umount $work_dir/BenchOs/sys/ 2>/dev/null
-  umount -R $work_dir/BenchOs/dev/ 2>/dev/null
+  umount "$work_dir/BenchOs/proc/" 2>/dev/null
+  umount "$work_dir/BenchOs/sys/" 2>/dev/null
+  umount -R "$work_dir/BenchOs/dev/" 2>/dev/null
 }
 
 function load_bench_os() {
-  cd $work_dir
+  cd "$work_dir"
   rm -rf BenchOs
 
   curl "-L#o" BenchOs.tar.gz $bench_os_url
   tar -xzf BenchOs.tar.gz
-  cd $work_dir/BenchOs
+  cd "$work_dir/BenchOs"
 
   mount -t proc /proc proc/
   mount --bind /sys sys/
@@ -218,7 +313,7 @@ function load_bench_os() {
 }
 
 function chroot_run() {
-  chroot $work_dir/BenchOs /bin/bash -c "$*"
+  chroot "$work_dir/BenchOs" /bin/bash -c "$*"
 }
 
 function load_part() {
@@ -227,7 +322,7 @@ function load_part() {
 }
 
 function load_3rd_program() {
-  chroot_run wget https://github.com/nxtrace/NTrace-core/releases/download/v1.3.7/nexttrace_linux_amd64 -qO /usr/local/bin/nexttrace
+  chroot_run wget "https://github.com/nxtrace/NTrace-core/releases/download/v1.3.7/$nexttrace_filename" -qO /usr/local/bin/nexttrace
   chroot_run chmod u+x /usr/local/bin/nexttrace
 }
 
@@ -431,20 +526,22 @@ function run_net_trace() {
 uploadAPI="https://api.nodequality.com/api/v1/record"
 function upload_result() {
 
-  chroot_run zip -j - "/result/*" >$work_dir/result.zip
+  chroot_run zip -j - "/result/*" >"$work_dir/result.zip"
 
-  base64 $work_dir/result.zip | curl -X POST --data-binary @- $uploadAPI
+  base64 "$work_dir/result.zip" | curl -X POST --data-binary @- "$uploadAPI"
 
   echo
 }
 
 function post_cleanup() {
+  local exit_status="${1:-0}"
+  trap - EXIT
   chroot_run umount -R /dev &>/dev/null
   clear_mount
 
   post_check_mount
 
-  rm -rf $work_dir/BenchOs
+  rm -rf "$work_dir/BenchOs"
 
   if [[ "$work_dir" == *"nodequality"* ]]; then
     rm -rf "${work_dir}"/
@@ -453,19 +550,19 @@ function post_cleanup() {
     exit 1
   fi
 
-  exit 1
+  exit "$exit_status"
 }
 
 function sig_cleanup() {
   trap '' INT TERM SIGHUP EXIT
   _green_bold "$(L cleanup)"
-  post_cleanup
+  post_cleanup 1
 }
 
 function post_check_mount() {
   if mount | grep nodequality$current_time; then
-    echo "$(L clean_fail)" | tee $work_dir/error.log >&2
-    exit
+    echo "$(L clean_fail)" | tee "$work_dir/error.log" >&2
+    exit 1
   fi
 }
 
@@ -509,27 +606,27 @@ function main() {
   _green_bold "$(L basicinfo)"
 
   result_directory=$work_dir/BenchOs/result
-  mkdir -p $result_directory
-  run_header >$result_directory/$header_info_filename
+  mkdir -p "$result_directory"
+  run_header >"$result_directory/$header_info_filename"
 
   if [[ "$run_hardware_quality_test" =~ ^[YyFfVv]$ ]]; then
     _green_bold "$(L run_hq)"
-    run_HardwareQuality | tee $result_directory/$hardware_quality_filename
+    run_HardwareQuality | tee "$result_directory/$hardware_quality_filename"
   fi
 
   if [[ "$run_ip_quality_test" =~ ^[Yy]$ ]]; then
     _green_bold "$(L run_iq)"
-    run_ip_quality | tee $result_directory/$ip_quality_filename
+    run_ip_quality | tee "$result_directory/$ip_quality_filename"
   fi
 
   if [[ "$run_net_quality_test" =~ ^[YyLl]$ ]]; then
     _green_bold "$(L run_nq)"
-    run_net_quality | tee $result_directory/$net_quality_filename
+    run_net_quality | tee "$result_directory/$net_quality_filename"
   fi
 
   if [[ "$run_net_trace_test" =~ ^[Yy]$ ]]; then
     _green_bold "$(L run_bt)"
-    run_net_trace | tee $result_directory/$backroute_trace_filename
+    run_net_trace | tee "$result_directory/$backroute_trace_filename"
   fi
 
   upload_result
