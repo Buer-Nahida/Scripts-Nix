@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+nodequality_nixos_compat_version="nixos-compat-v3"
+
 # Host-side dependencies needed before entering BenchOS.
 # On normal Linux distributions the script keeps using the existing PATH.
 # If some commands are missing and Nix is installed, create a tiny PATH shim with
@@ -12,13 +14,13 @@ function setup_host_deps() {
   # when Nix is unavailable; optional ones stay optional to preserve behavior
   # on ordinary distros.
   local hard_required_cmds=(
-    awk base64 cat chroot cp curl date df grep gzip mkdir mount ps rm tail tar
-    tee tr umount uname wc
+    awk base64 cat chmod chroot cp curl date df grep gzip mkdir mount ps rm tail tar
+    tee tr umount uname wc zip
   )
   local nix_supplied_cmds=(
     "${hard_required_cmds[@]}"
-    chmod dd findmnt free ls lsblk lsmod mkswap paste readlink sed sort stat
-    swapoff swapon who
+    dd findmnt free ls lsblk lsmod mkswap paste readlink sed sort stat
+    swapoff swapon who zip
   )
   local missing_required_cmds=()
   local missing_nix_cmds=()
@@ -56,6 +58,7 @@ function setup_host_deps() {
     nixpkgs#gnugrep
     nixpkgs#gnused
     nixpkgs#kmod
+    nixpkgs#zip
   )
 
   echo "Detected missing host commands: ${missing_nix_cmds[*]}" >&2
@@ -169,10 +172,10 @@ function start_ascii() {
 
 ███╗   ██╗ ██████╗ ██████╗ ███████╗ ██████╗ ██╗   ██╗ █████╗ ██╗     ██╗████████╗██╗   ██╗
 ████╗  ██║██╔═══██╗██╔══██╗██╔════╝██╔═══██╗██║   ██║██╔══██╗██║     ██║╚══██╔══╝╚██╗ ██╔╝
-██╔██╗ ██║██║   ██║██║  ██║█████╗  ██║   ██║██║   ██║███████║██║     ██║   ██║    ╚████╔╝ 
-██║╚██╗██║██║   ██║██║  ██║██╔══╝  ██║▄▄ ██║██║   ██║██╔══██║██║     ██║   ██║     ╚██╔╝  
-██║ ╚████║╚██████╔╝██████╔╝███████╗╚██████╔╝╚██████╔╝██║  ██║███████╗██║   ██║      ██║   
-╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚══════╝ ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝   ╚═╝      ╚═╝   
+██╔██╗ ██║██║   ██║██║  ██║█████╗  ██║   ██║██║   ██║███████║██║     ██║   ██║    ╚████╔╝
+██║╚██╗██║██║   ██║██║  ██║██╔══╝  ██║▄▄ ██║██║   ██║██╔══██║██║     ██║   ██║     ╚██╔╝
+██║ ╚████║╚██████╔╝██████╔╝███████╗╚██████╔╝╚██████╔╝██║  ██║███████╗██║   ██║      ██║
+╚═╝  ╚═══╝ ╚═════╝ ╚═════╝ ╚══════╝ ╚══▀▀═╝  ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝   ╚═╝      ╚═╝
 
 EOF
   if [[ "$lang" == "en" ]]; then
@@ -299,7 +302,7 @@ function load_bench_os() {
   cd "$work_dir"
   rm -rf BenchOs
 
-  curl "-L#o" BenchOs.tar.gz $bench_os_url
+  curl "-L#o" BenchOs.tar.gz "$bench_os_url"
   tar -xzf BenchOs.tar.gz
   cd "$work_dir/BenchOs"
 
@@ -312,8 +315,35 @@ function load_bench_os() {
   cp /etc/resolv.conf etc/resolv.conf
 }
 
+# BenchOS is a normal FHS rootfs. Never inherit host PATH here:
+# NixOS / nix shell often provides /nix/store/... entries that do not exist
+# inside the chroot. That is exactly what causes "bash/wget/env/zip: command not found".
+bench_os_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 function chroot_run() {
-  chroot "$work_dir/BenchOs" /bin/bash -c "$*"
+  # Run a shell command string inside BenchOS with a clean FHS PATH.
+  # Keep this for shell features such as wildcard expansion.
+  chroot "$work_dir/BenchOs" /bin/bash -c "export PATH='$bench_os_path'; $*"
+}
+
+function chroot_exec() {
+  # Run argv safely inside BenchOS without relying on command lookup from the host.
+  chroot "$work_dir/BenchOs" /bin/bash -c 'export PATH="$1"; shift; exec "$@"' nodequality-chroot "$bench_os_path" "$@"
+}
+
+function chroot_exec_with_nqenv() {
+  local nqenv_payload="$1"
+  shift
+  chroot "$work_dir/BenchOs" /bin/bash -c 'export PATH="$1"; export NQENV="$2"; shift 2; exec "$@"' nodequality-chroot "$bench_os_path" "$nqenv_payload" "$@"
+}
+
+function fetch_bench_script() {
+  local url="$1"
+  local name="$2"
+  local dest_host="$work_dir/BenchOs/tmp/$name"
+  mkdir -p "$work_dir/BenchOs/tmp"
+  curl -fsSL "$url" -o "$dest_host"
+  printf '/tmp/%s\n' "$name"
 }
 
 function load_part() {
@@ -322,12 +352,18 @@ function load_part() {
 }
 
 function load_3rd_program() {
-  chroot_run wget "https://github.com/nxtrace/NTrace-core/releases/download/v1.3.7/$nexttrace_filename" -qO /usr/local/bin/nexttrace
-  chroot_run chmod u+x /usr/local/bin/nexttrace
+  # Download from the host into the BenchOS rootfs. Do not call wget/chmod
+  # inside the chroot; minimal BenchOS images plus inherited Nix PATH break that.
+  mkdir -p "$work_dir/BenchOs/usr/local/bin"
+  curl -fsSL "https://github.com/nxtrace/NTrace-core/releases/download/v1.3.7/$nexttrace_filename" \
+    -o "$work_dir/BenchOs/usr/local/bin/nexttrace"
+  chmod u+x "$work_dir/BenchOs/usr/local/bin/nexttrace"
 }
 
 function run_header() {
-  chroot_run bash <(curl -Ls "$raw_file_prefix/part/header.sh")
+  local script_path
+  script_path="$(fetch_bench_script "$raw_file_prefix/part/header.sh" "nodequality-header.sh")" || return 1
+  chroot_exec /bin/bash "$script_path"
 }
 
 function detect_virt() {
@@ -500,35 +536,49 @@ function pre_fetch_info() {
 ############ 以上内容为HQ预处理部分 ############
 
 function run_HardwareQuality() {
-  local params=""
-  [[ "$run_hardware_quality_test" =~ ^[Ff]$ ]] && params=" -F"
-  [[ "$run_hardware_quality_test" =~ ^[Vv]$ ]] && params=" -V"
+  local params=()
+  [[ "$run_hardware_quality_test" =~ ^[Ff]$ ]] && params+=("-F")
+  [[ "$run_hardware_quality_test" =~ ^[Vv]$ ]] && params+=("-V")
   pre_fetch_info                                                                                                                                                      # HQ预处理
+  local payload script_path
   payload=$(declare -p osinfo meminfo diskinfo)                                                                                                                       # HQ预处理
-  curl -Ls https://Hardware.Check.Place | chroot_run "env NQENV=$(printf '%q' "$payload") bash -s -- $opt_lang $params -y -o /result/$hardware_quality_json_filename" # HQ预处理
+  script_path="$(fetch_bench_script "https://Hardware.Check.Place" "nodequality-hardware.sh")" || return 1
+  chroot_exec_with_nqenv "$payload" /bin/bash "$script_path" $opt_lang "${params[@]}" -y -o "/result/$hardware_quality_json_filename"                             # HQ预处理
   # 原始语句为：chroot_run bash <(curl -Ls https://Hardware.Check.Place) $opt_lang -y -o /result/$hardware_quality_json_filename
 }
 
 function run_ip_quality() {
-  chroot_run bash <(curl -Ls https://IP.Check.Place) $opt_ipv $opt_lang -y -o /result/$ip_quality_json_filename
+  local script_path
+  script_path="$(fetch_bench_script "https://IP.Check.Place" "nodequality-ip.sh")" || return 1
+  chroot_exec /bin/bash "$script_path" $opt_ipv $opt_lang -y -o "/result/$ip_quality_json_filename"
 }
 
 function run_net_quality() {
-  local params=""
-  [[ "$run_net_quality_test" =~ ^[Ll]$ ]] && params=" -L"
-  chroot_run bash <(curl -Ls https://Net.Check.Place) $opt_ipv $opt_lang $params -y -o /result/$net_quality_json_filename
+  local params=()
+  [[ "$run_net_quality_test" =~ ^[Ll]$ ]] && params+=("-L")
+  local script_path
+  script_path="$(fetch_bench_script "https://Net.Check.Place" "nodequality-net.sh")" || return 1
+  chroot_exec /bin/bash "$script_path" $opt_ipv $opt_lang "${params[@]}" -y -o "/result/$net_quality_json_filename"
 }
 
 function run_net_trace() {
-  chroot_run bash <(curl -Ls https://Net.Check.Place) $opt_ipv $opt_lang -R -n -S 123 -o /result/$backroute_trace_json_filename
+  local script_path
+  script_path="$(fetch_bench_script "https://Net.Check.Place" "nodequality-net-trace.sh")" || return 1
+  chroot_exec /bin/bash "$script_path" $opt_ipv $opt_lang -R -n -S 123 -o "/result/$backroute_trace_json_filename"
 }
 
 uploadAPI="https://api.nodequality.com/api/v1/record"
 function upload_result() {
+  # Create the archive from the host path. This avoids requiring zip inside BenchOS.
+  if ! (cd "$work_dir/BenchOs/result" && zip -j - ./*) >"$work_dir/result.zip"; then
+    echo "Error: failed to create result archive from host." >&2
+    return 1
+  fi
 
-  chroot_run zip -j - "/result/*" >"$work_dir/result.zip"
-
-  base64 "$work_dir/result.zip" | curl -X POST --data-binary @- "$uploadAPI"
+  if ! base64 "$work_dir/result.zip" | curl -fsS -X POST --data-binary @- "$uploadAPI"; then
+    echo "Error: failed to upload result archive." >&2
+    return 1
+  fi
 
   echo
 }
@@ -591,6 +641,7 @@ function main() {
   trap 'sig_cleanup' INT TERM SIGHUP EXIT
 
   start_ascii
+  _blue "NodeQuality NixOS compatibility layer: ${nodequality_nixos_compat_version}"
 
   ask_question
 
@@ -629,7 +680,7 @@ function main() {
     run_net_trace | tee "$result_directory/$backroute_trace_filename"
   fi
 
-  upload_result
+  upload_result || post_cleanup 1
   _green_bold "$(L cleanup_after)"
   post_cleanup
 }
